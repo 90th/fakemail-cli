@@ -1,0 +1,16 @@
+[package]
+name = "fakemail-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight, stateful, and zero-async command line interface for FakeMail.net"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/90th/fakemail-cli"
+keywords = ["temp-mail", "cli", "fakemail", "email", "interactive"]
+categories = ["command-line-utilities", "email"]
+
+[dependencies]
+ureq = { version = "2.10.1", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rustyline = "14.0.0"
