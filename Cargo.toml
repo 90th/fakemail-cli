@@ -10,7 +10,7 @@ keywords = ["temp-mail", "cli", "fakemail", "email", "interactive"]
 categories = ["command-line-utilities", "email"]
 
 [dependencies]
-ureq = { version = "2.10.1", features = ["json"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-rustyline = "14.0.0"
+ureq = { version = "=2.12.1", features = ["json"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+rustyline = "18.0.1"
