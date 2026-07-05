@@ -31,6 +31,8 @@ pub struct FakeMailClient {
     cookies: HashMap<String, String>,
     session_file: PathBuf,
     agent: ureq::Agent,
+    base_url: String,
+    home_url: String,
 }
 
 #[derive(Debug)]
@@ -134,8 +136,8 @@ fn update_cookies(cookies: &mut HashMap<String, String>, resp: &ureq::Response) 
     }
 }
 
-fn is_redirected_to_home(resp: &ureq::Response) -> bool {
-    resp.get_url().trim_end_matches('/') == BASE_URL
+fn is_redirected_to_home(resp: &ureq::Response, base_url: &str) -> bool {
+    resp.get_url().trim_end_matches('/') == base_url
 }
 
 fn is_html_response(body: &str) -> bool {
@@ -160,8 +162,8 @@ fn build_agent() -> ureq::Agent {
         .build()
 }
 
-fn endpoint(path: &str) -> String {
-    format!("{BASE_URL}{path}")
+fn endpoint(base_url: &str, path: &str) -> String {
+    format!("{base_url}{path}")
 }
 
 fn parse_email_id(email_id: &str) -> Result<u64, ClientError> {
@@ -215,6 +217,8 @@ impl FakeMailClient {
             cookies: HashMap::new(),
             session_file,
             agent: build_agent(),
+            base_url: BASE_URL.to_string(),
+            home_url: HOME_URL.to_string(),
         };
         client.load_session()?;
         Ok(client)
@@ -317,21 +321,24 @@ impl FakeMailClient {
 
     fn ajax_request(&self, method: &str, url: &str) -> ureq::Request {
         self.request(method, url)
-            .set("Referer", HOME_URL)
+            .set("Referer", &self.home_url)
             .set("X-Requested-With", "XMLHttpRequest")
     }
 
     pub fn init_new_session(&mut self) -> Result<(), ClientError> {
         self.cookies.clear();
 
-        let resp = self.request("GET", HOME_URL).call()?;
+        let resp = self.request("GET", &self.home_url).call()?;
         update_cookies(&mut self.cookies, &resp);
         let body = resp.into_string()?;
 
         self.csrf_token = extract_csrf_token(&body)
             .ok_or_else(|| ClientError::Other("Could not find CSRF token on main page".into()))?;
 
-        let index_url = endpoint(&format!("/index/index?csrf_token={}", self.csrf_token));
+        let index_url = endpoint(
+            &self.base_url,
+            &format!("/index/index?csrf_token={}", self.csrf_token),
+        );
         let resp = self.ajax_request("GET", &index_url).call()?;
 
         update_cookies(&mut self.cookies, &resp);
@@ -356,7 +363,7 @@ impl FakeMailClient {
 
     pub fn set_custom_username(&mut self, prefix: &str) -> Result<String, ClientError> {
         let cleaned_prefix = validate_username(prefix)?;
-        let url = endpoint("/index/new-email/");
+        let url = endpoint(&self.base_url, "/index/new-email/");
         let resp = self
             .ajax_request("POST", &url)
             .send_form(&[("emailInput", cleaned_prefix.as_str()), ("format", "json")])?;
@@ -387,10 +394,10 @@ impl FakeMailClient {
     }
 
     fn get_inbox_internal(&mut self) -> Result<serde_json::Value, ClientError> {
-        let url = endpoint("/index/refresh");
+        let url = endpoint(&self.base_url, "/index/refresh");
         let resp = self.ajax_request("GET", &url).call()?;
 
-        if is_redirected_to_home(&resp) {
+        if is_redirected_to_home(&resp, &self.base_url) {
             return Err(ClientError::SessionExpired);
         }
 
@@ -406,10 +413,10 @@ impl FakeMailClient {
     }
 
     fn read_email_internal(&mut self, email_id: u64) -> Result<String, ClientError> {
-        let url = endpoint(&format!("/email/id/{email_id}"));
+        let url = endpoint(&self.base_url, &format!("/email/id/{email_id}"));
         let resp = self.request("GET", &url).call()?;
 
-        if is_redirected_to_home(&resp) {
+        if is_redirected_to_home(&resp, &self.base_url) {
             return Err(ClientError::SessionExpired);
         }
 
@@ -426,13 +433,13 @@ impl FakeMailClient {
     }
 
     fn delete_email_internal(&mut self, email_id: u64) -> Result<(), ClientError> {
-        let url = endpoint(&format!("/delete-email/{email_id}"));
+        let url = endpoint(&self.base_url, &format!("/delete-email/{email_id}"));
         let id = email_id.to_string();
         let resp = self
             .ajax_request("POST", &url)
             .send_form(&[("id", id.as_str())])?;
 
-        if is_redirected_to_home(&resp) {
+        if is_redirected_to_home(&resp, &self.base_url) {
             return Err(ClientError::SessionExpired);
         }
 
@@ -454,23 +461,23 @@ impl FakeMailClient {
     }
 
     fn extend_lifetime_internal(&mut self, seconds: u64) -> Result<(), ClientError> {
-        let url = endpoint(&format!("/expirace/{seconds}"));
+        let url = endpoint(&self.base_url, &format!("/expirace/{seconds}"));
         let resp = self.request("GET", &url).call()?;
 
-        if is_redirected_to_home(&resp) {
-            return Err(ClientError::SessionExpired);
+        update_cookies(&mut self.cookies, &resp);
+        if is_redirected_to_home(&resp, &self.base_url) {
+            self.get_lifetime_internal()?;
         }
 
-        update_cookies(&mut self.cookies, &resp);
         self.save_session()?;
         Ok(())
     }
 
     fn get_lifetime_internal(&mut self) -> Result<(String, String), ClientError> {
-        let url = endpoint("/index/zivot");
+        let url = endpoint(&self.base_url, "/index/zivot");
         let resp = self.ajax_request("GET", &url).call()?;
 
-        if is_redirected_to_home(&resp) {
+        if is_redirected_to_home(&resp, &self.base_url) {
             return Err(ClientError::SessionExpired);
         }
 
@@ -486,12 +493,12 @@ impl FakeMailClient {
         let ted = json_data
             .get("ted")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
+            .ok_or(ClientError::SessionExpired)?
             .to_string();
         let konec = json_data
             .get("konec")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
+            .ok_or(ClientError::SessionExpired)?
             .to_string();
 
         Ok((ted, konec))
@@ -532,17 +539,7 @@ impl FakeMailClient {
     }
 
     pub fn extend_lifetime(&mut self, seconds: u64) -> Result<(), ClientError> {
-        match self.extend_lifetime_internal(seconds) {
-            Err(ClientError::SessionExpired) => {
-                self.init_new_session()?;
-                eprintln!(
-                    "\x1B[33mSession expired. Generated new mailbox: {}\x1B[0m",
-                    self.email
-                );
-                self.extend_lifetime_internal(seconds)
-            }
-            other => other,
-        }
+        self.extend_lifetime_internal(seconds)
     }
 
     pub fn get_lifetime(&mut self) -> Result<(String, String), ClientError> {
@@ -557,5 +554,196 @@ impl FakeMailClient {
             }
             other => other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    /// Minimal HTTP test server built on std primitives.
+    ///
+    /// The handler closure receives the raw request path and returns
+    /// `(status, headers, body)`.  Redirect Location headers should use
+    /// relative or absolute paths — the test never needs the port.
+    struct TestServer {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        _handle: thread::JoinHandle<()>,
+    }
+
+    type Response = (u16, Vec<(String, String)>, Vec<u8>);
+
+    impl TestServer {
+        fn new<F>(handler: F) -> Self
+        where
+            F: Fn(&str) -> Response + Send + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind test server");
+            let port = listener.local_addr().unwrap().port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_clone = stop.clone();
+
+            let handle = thread::spawn(move || {
+                listener.set_nonblocking(true).ok();
+                loop {
+                    if stop_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // Use &mut so match ergonomics gives &mut TcpStream (needed for
+                    // read/write).
+                    match &mut listener.accept() {
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                        Err(_) => break,
+                        Ok((stream, _)) => {
+                            let mut buf = [0; 8192];
+                            let n = match stream.read(&mut buf) {
+                                Ok(0) | Err(_) => continue,
+                                Ok(n) => n,
+                            };
+                            let request = String::from_utf8_lossy(&buf[..n]);
+                            let path = request
+                                .lines()
+                                .next()
+                                .and_then(|l| l.split_whitespace().nth(1))
+                                .unwrap_or("/");
+
+                            let (status, headers, body) = handler(path);
+                            let status_text = match status {
+                                200 => "OK",
+                                302 => "Found",
+                                404 => "Not Found",
+                                _ => "Unknown",
+                            };
+
+                            let mut response = format!(
+                                "HTTP/1.1 {status} {status_text}\r\n\
+                                 Connection: close\r\n"
+                            );
+                            for (k, v) in &headers {
+                                response.push_str(&format!("{k}: {v}\r\n"));
+                            }
+                            response.push_str(&format!("Content-Length: {}\r\n", body.len()));
+                            response.push_str("\r\n");
+
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.write_all(&body);
+                            let _ = stream.flush();
+                        }
+                    }
+                }
+            });
+
+            TestServer {
+                port,
+                stop,
+                _handle: handle,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://127.0.0.1:{}", self.port)
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            // Connect to unblock the accept loop's sleep/poll.
+            let _ = TcpStream::connect(format!("127.0.0.1:{}", self.port));
+        }
+    }
+
+    static SESSION_COUNTER: AtomicU16 = AtomicU16::new(0);
+
+    fn unique_session_path() -> PathBuf {
+        let n = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("fakemail_test_session_{n}.json"))
+    }
+
+    /// Construct a FakeMailClient pointed at a local test server with a
+    /// session file in a temp directory and the given email pre-populated.
+    fn test_client(base_url: &str, email: &str) -> FakeMailClient {
+        let session_file = unique_session_path();
+        // Remove any leftover from a previous run.
+        let _ = std::fs::remove_file(&session_file);
+
+        FakeMailClient {
+            email: email.to_string(),
+            password: String::new(),
+            csrf_token: "00000000000000000000000000000000\
+                         00000000000000000000000000000000"
+                .to_string(),
+            cookies: HashMap::new(),
+            session_file,
+            agent: ureq::builder().build(),
+            base_url: base_url.to_string(),
+            home_url: format!("{base_url}/"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Tests
+    // ------------------------------------------------------------------
+
+    /// Success path: /expirace/3600 redirects → /, then /index/zivot
+    /// returns valid JSON.  Extend returns Ok and preserves the existing
+    /// email/session.
+    #[test]
+    fn extend_lifetime_success() {
+        let server = TestServer::new(|path| {
+            if path.starts_with("/expirace/") {
+                // Successful extension redirects to home; ureq follows.
+                (302, vec![("Location".into(), "/".into())], Vec::new())
+            } else if path == "/index/zivot" {
+                (
+                    200,
+                    vec![("Content-Type".into(), "application/json".into())],
+                    br#"{"ted":"1 day","konec":"2026-07-06"}"#.to_vec(),
+                )
+            } else {
+                // Root page (redirect target) — just a valid HTML body.
+                (200, vec![], b"<html><body>ok</body></html>".to_vec())
+            }
+        });
+
+        let mut client = test_client(&server.url(), "regression@forliion.com");
+        let result = client.extend_lifetime(3600);
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert_eq!(client.email(), "regression@forliion.com");
+    }
+
+    /// Expired-session path: /expirace/3600 redirects → /, then
+    /// /index/zivot also redirects → home (signalling session expiry).
+    /// Extend returns SessionExpired and preserves the existing email
+    /// without calling init_new_session.
+    #[test]
+    fn extend_lifetime_expired_session() {
+        let server = TestServer::new(|path| {
+            if path.starts_with("/expirace/") {
+                (302, vec![("Location".into(), "/".into())], Vec::new())
+            } else if path == "/index/zivot" {
+                // Session-check endpoint redirects → expired.
+                (302, vec![("Location".into(), "/".into())], Vec::new())
+            } else {
+                (200, vec![], b"<html><body>ok</body></html>".to_vec())
+            }
+        });
+
+        let mut client = test_client(&server.url(), "expired@forliion.com");
+        let result = client.extend_lifetime(3600);
+
+        assert!(matches!(result, Err(ClientError::SessionExpired)));
+        assert_eq!(client.email(), "expired@forliion.com");
     }
 }

@@ -294,7 +294,7 @@ pub fn parse_duration(input: &str) -> Result<u64, String> {
     let cleaned = cleaned.strip_prefix('+').unwrap_or(&cleaned);
 
     match cleaned {
-        "10m" | "10min" => Ok(600),
+        "10m" | "10min" => Ok(4200),
         "1d" | "1day" => Ok(86400),
         "3d" | "3days" => Ok(259200),
         "5d" | "5days" => Ok(432000),
@@ -321,8 +321,8 @@ mod tests {
 
     #[test]
     fn parse_duration_known_aliases() {
-        assert_eq!(parse_duration("10m"), Ok(600));
-        assert_eq!(parse_duration("10min"), Ok(600));
+        assert_eq!(parse_duration("10m"), Ok(4200));
+        assert_eq!(parse_duration("10min"), Ok(4200));
         assert_eq!(parse_duration("1d"), Ok(86400));
         assert_eq!(parse_duration("1day"), Ok(86400));
         assert_eq!(parse_duration("3d"), Ok(259200));
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn parse_duration_plus_prefix_and_case() {
-        assert_eq!(parse_duration("+10m"), Ok(600));
+        assert_eq!(parse_duration("+10m"), Ok(4200));
         assert_eq!(parse_duration("+1d"), Ok(86400));
         assert_eq!(parse_duration("1D"), Ok(86400));
         assert_eq!(parse_duration("1W"), Ok(604800));
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn parse_duration_whitespace_trimmed() {
-        assert_eq!(parse_duration("  10m  "), Ok(600));
+        assert_eq!(parse_duration("  10m  "), Ok(4200));
         assert_eq!(parse_duration("\t1d\n"), Ok(86400));
     }
 
