@@ -1,19 +1,15 @@
 use crate::client::FakeMailClient;
-use crate::html::{get_remaining_time, parse_duration};
+use crate::commands::{GREEN, RED, RESET, YELLOW, print_inbox_table, print_mailbox, print_status};
+use crate::html::parse_duration;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::io::{self, Write};
-
-const GREEN: &str = "\x1B[32m";
-const RED: &str = "\x1B[31m";
-const YELLOW: &str = "\x1B[33m";
-const RESET: &str = "\x1B[0m";
 
 pub fn run_interactive(mut client: FakeMailClient) {
     println!("============================================================");
     println!("  FakeMail CLI Client");
     println!("============================================================");
-    println!("Current Inbox: {GREEN}{}{RESET}", client.email);
+    println!("Current Inbox: {GREEN}{}{RESET}", client.email());
     println!("Type 'help' or '?' to list commands. (Use Up/Down arrows for command history)\n");
 
     let mut rl = match DefaultEditor::new() {
@@ -25,7 +21,7 @@ pub fn run_interactive(mut client: FakeMailClient) {
     };
 
     loop {
-        let prompt = format!("{YELLOW}{}{RESET} > ", client.email);
+        let prompt = format!("{YELLOW}{}{RESET} > ", client.email());
         let readline = rl.readline(&prompt);
         match readline {
             Ok(line) => {
@@ -37,7 +33,7 @@ pub fn run_interactive(mut client: FakeMailClient) {
                 let _ = rl.add_history_entry(trimmed);
 
                 let mut parts = trimmed.splitn(2, ' ');
-                let cmd = parts.next().unwrap().to_lowercase();
+                let cmd = parts.next().unwrap_or_default().to_lowercase();
                 let arg = parts.next().unwrap_or("").trim();
 
                 match cmd.as_str() {
@@ -60,28 +56,13 @@ pub fn run_interactive(mut client: FakeMailClient) {
                         println!("  exit / quit     Exit the CLI");
                     }
                     "status" => {
-                        println!("Active Email:   {GREEN}{}{RESET}", client.email);
-                        if !client.password.is_empty() {
-                            println!("Temp Password:  {GREEN}{}{RESET}", client.password);
-                        }
-                        match client.get_lifetime() {
-                            Ok((ted, konec)) => {
-                                let rem = get_remaining_time(&ted, &konec);
-                                println!("Remaining Time: {YELLOW}{}{RESET}", rem);
-                            }
-                            Err(_) => {
-                                println!("Remaining Time: Unknown");
-                            }
-                        }
+                        print_status(&mut client, "Temp Password:");
                     }
                     "new" => {
                         println!("Initializing new mailbox...");
                         match client.init_new_session() {
                             Ok(_) => {
-                                println!("New Email:      {GREEN}{}{RESET}", client.email);
-                                if !client.password.is_empty() {
-                                    println!("Password:       {GREEN}{}{RESET}", client.password);
-                                }
+                                print_mailbox(&client, "New Email:", "Password:");
                             }
                             Err(e) => println!("{RED}Error: {e}{RESET}"),
                         }
@@ -121,45 +102,7 @@ pub fn run_interactive(mut client: FakeMailClient) {
                     "list" | "ls" => {
                         println!("Checking inbox...");
                         match client.get_inbox() {
-                            Ok(emails) => {
-                                if let Some(arr) = emails.as_array() {
-                                    if arr.is_empty() {
-                                        println!("Inbox is empty.");
-                                    } else {
-                                        println!("\nFound {} email(s):", arr.len());
-                                        println!("{}", "-".repeat(60));
-                                        for mail in arr {
-                                            println!(
-                                                "ID:      {}",
-                                                mail.get("id")
-                                                    .and_then(|v: &serde_json::Value| v.as_i64())
-                                                    .unwrap_or(0)
-                                            );
-                                            println!(
-                                                "From:    {}",
-                                                mail.get("od")
-                                                    .and_then(|v: &serde_json::Value| v.as_str())
-                                                    .unwrap_or("")
-                                            );
-                                            println!(
-                                                "Date:    {}",
-                                                mail.get("kdy")
-                                                    .and_then(|v: &serde_json::Value| v.as_str())
-                                                    .unwrap_or("")
-                                            );
-                                            println!(
-                                                "Subject: {}",
-                                                mail.get("predmet")
-                                                    .and_then(|v: &serde_json::Value| v.as_str())
-                                                    .unwrap_or("")
-                                            );
-                                            println!("{}", "-".repeat(60));
-                                        }
-                                    }
-                                } else {
-                                    println!("Unexpected response structure from server.");
-                                }
-                            }
+                            Ok(emails) => print_inbox_table(&emails),
                             Err(e) => println!("{RED}Error: {e}{RESET}"),
                         }
                     }

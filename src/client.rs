@@ -2,8 +2,18 @@ use crate::html::{clean_whitespace, html_to_text, url_decode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+const BASE_URL: &str = "https://www.fakemail.net";
+const HOME_URL: &str = "https://www.fakemail.net/";
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct SessionState {
@@ -15,16 +25,18 @@ struct SessionState {
 }
 
 pub struct FakeMailClient {
-    pub email: String,
-    pub password: String,
-    pub csrf_token: String,
-    pub cookies: HashMap<String, String>,
+    email: String,
+    password: String,
+    csrf_token: String,
+    cookies: HashMap<String, String>,
     session_file: PathBuf,
+    agent: ureq::Agent,
 }
 
 #[derive(Debug)]
 pub enum ClientError {
     SessionExpired,
+    InvalidEmailId(String),
     Http(Box<ureq::Error>),
     Json(serde_json::Error),
     Io(std::io::Error),
@@ -35,6 +47,7 @@ impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SessionExpired => write!(f, "Session expired"),
+            Self::InvalidEmailId(id) => write!(f, "Invalid email ID: {}", id),
             Self::Http(e) => write!(f, "HTTP error: {}", e),
             Self::Json(e) => write!(f, "JSON error: {}", e),
             Self::Io(e) => write!(f, "IO error: {}", e),
@@ -63,22 +76,42 @@ impl From<std::io::Error> for ClientError {
     }
 }
 
-impl From<Box<dyn std::error::Error>> for ClientError {
-    fn from(e: Box<dyn std::error::Error>) -> Self {
-        Self::Other(e.to_string())
-    }
+fn home_dir() -> PathBuf {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn get_session_file_path() -> PathBuf {
-    let home = env::var("HOME")
-        .or_else(|_| env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".fakemail_cli_session.json")
+    let state_home = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".local").join("state"));
+    state_home.join("fakemail-cli").join("session.json")
+}
+
+fn get_legacy_session_file_path() -> PathBuf {
+    home_dir().join(".fakemail_cli_session.json")
+}
+
+fn path_exists(path: &Path) -> Result<bool, ClientError> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(ClientError::Other(format!(
+            "Could not inspect session file {}: {}",
+            path.display(),
+            e
+        ))),
+    }
 }
 
 fn get_cookie_string(cookies: &HashMap<String, String>) -> String {
+    let mut pairs: Vec<_> = cookies.iter().collect();
+    pairs.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+
     let mut cookie_str = String::new();
-    for (i, (k, v)) in cookies.iter().enumerate() {
+    for (i, (k, v)) in pairs.into_iter().enumerate() {
         if i > 0 {
             cookie_str.push_str("; ");
         }
@@ -102,15 +135,74 @@ fn update_cookies(cookies: &mut HashMap<String, String>, resp: &ureq::Response) 
 }
 
 fn is_redirected_to_home(resp: &ureq::Response) -> bool {
-    let url = resp.get_url();
-    url == "https://www.fakemail.net" || url == "https://www.fakemail.net/"
+    resp.get_url().trim_end_matches('/') == BASE_URL
 }
 
 fn is_html_response(body: &str) -> bool {
-    let trimmed = body.trim();
-    trimmed.starts_with("<!DOCTYPE")
-        || trimmed.starts_with("<html")
-        || trimmed.starts_with("<!doctype")
+    let prefix = body
+        .trim_start()
+        .chars()
+        .take(128)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+
+    prefix.starts_with("<!doctype")
+        || prefix.starts_with("<html")
+        || prefix.starts_with("<?xml")
+        || prefix.starts_with("<!--") && prefix.contains("<html")
+}
+
+fn build_agent() -> ureq::Agent {
+    ureq::builder()
+        .timeout_connect(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .timeout_read(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .timeout_write(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .build()
+}
+
+fn endpoint(path: &str) -> String {
+    format!("{BASE_URL}{path}")
+}
+
+fn parse_email_id(email_id: &str) -> Result<u64, ClientError> {
+    let trimmed = email_id.trim();
+    if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return Err(ClientError::InvalidEmailId(email_id.to_string()));
+    }
+    trimmed
+        .parse::<u64>()
+        .map_err(|_| ClientError::InvalidEmailId(email_id.to_string()))
+}
+
+fn extract_csrf_token(body: &str) -> Option<String> {
+    let token = body.split_once("const CSRF=\"")?.1.get(..64)?;
+    token
+        .chars()
+        .all(|c| c.is_ascii_hexdigit())
+        .then(|| token.to_string())
+}
+
+fn validate_username(prefix: &str) -> Result<String, ClientError> {
+    let normalized = prefix.trim().to_lowercase();
+    let valid_chars = normalized
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    let valid_edges = normalized
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && normalized
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+
+    if normalized.len() < 3 || normalized.len() > 18 || !valid_chars || !valid_edges {
+        return Err(ClientError::Other(
+            "Username must be 3-18 ASCII letters, digits, dots, or hyphens and must start and end with a letter or digit.".into(),
+        ));
+    }
+
+    Ok(normalized)
 }
 
 impl FakeMailClient {
@@ -122,25 +214,55 @@ impl FakeMailClient {
             csrf_token: String::new(),
             cookies: HashMap::new(),
             session_file,
+            agent: build_agent(),
         };
         client.load_session()?;
         Ok(client)
     }
 
-    fn load_session(&mut self) -> Result<(), ClientError> {
-        let read_and_parse = || -> Result<SessionState, Box<dyn std::error::Error>> {
-            let content = fs::read_to_string(&self.session_file)?;
-            let state = serde_json::from_str(&content)?;
-            Ok(state)
-        };
+    pub fn email(&self) -> &str {
+        &self.email
+    }
 
-        if let Ok(state) = read_and_parse() {
-            self.email = state.email;
-            self.password = state.password;
-            self.csrf_token = state.csrf_token;
-            self.cookies = state.cookies;
+    pub fn password(&self) -> &str {
+        &self.password
+    }
+
+    fn load_session_from(&mut self, path: &Path) -> Result<(), ClientError> {
+        let content = fs::read_to_string(path).map_err(|e| {
+            ClientError::Other(format!(
+                "Could not read session file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        let state: SessionState = serde_json::from_str(&content).map_err(|e| {
+            ClientError::Other(format!(
+                "Could not parse session file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        self.email = state.email;
+        self.password = state.password;
+        self.csrf_token = state.csrf_token;
+        self.cookies = state.cookies;
+        Ok(())
+    }
+
+    fn load_session(&mut self) -> Result<(), ClientError> {
+        if path_exists(&self.session_file)? {
+            return self.load_session_from(&self.session_file.clone());
+        }
+
+        let legacy_session_file = get_legacy_session_file_path();
+        if legacy_session_file != self.session_file && path_exists(&legacy_session_file)? {
+            self.load_session_from(&legacy_session_file)?;
+            self.save_session()?;
             return Ok(());
         }
+
         self.init_new_session()
     }
 
@@ -152,17 +274,38 @@ impl FakeMailClient {
             cookies: self.cookies.clone(),
         };
         let content = serde_json::to_string_pretty(&state)?;
-        fs::write(&self.session_file, content)?;
+
+        if let Some(parent) = self.session_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let tmp_path = self.session_file.with_extension("json.tmp");
+        if path_exists(&tmp_path)? {
+            fs::remove_file(&tmp_path)?;
+        }
+
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+
+        let mut tmp_file = options.open(&tmp_path)?;
+        tmp_file.write_all(content.as_bytes())?;
+        tmp_file.write_all(b"\n")?;
+        tmp_file.sync_all()?;
+        drop(tmp_file);
+
+        fs::rename(&tmp_path, &self.session_file)?;
         Ok(())
     }
 
     fn request(&self, method: &str, url: &str) -> ureq::Request {
         let mut req = match method {
-            "POST" => ureq::post(url),
-            _ => ureq::get(url),
+            "POST" => self.agent.post(url),
+            _ => self.agent.get(url),
         };
 
-        req = req.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        req = req.set("User-Agent", USER_AGENT);
 
         let cookie_str = get_cookie_string(&self.cookies);
         if !cookie_str.is_empty() {
@@ -172,92 +315,56 @@ impl FakeMailClient {
         req
     }
 
+    fn ajax_request(&self, method: &str, url: &str) -> ureq::Request {
+        self.request(method, url)
+            .set("Referer", HOME_URL)
+            .set("X-Requested-With", "XMLHttpRequest")
+    }
+
     pub fn init_new_session(&mut self) -> Result<(), ClientError> {
         self.cookies.clear();
 
-        // 1. Fetch main page to get PHPSESSID and CSRF token
-        let resp = self.request("GET", "https://www.fakemail.net/").call()?;
+        let resp = self.request("GET", HOME_URL).call()?;
         update_cookies(&mut self.cookies, &resp);
         let body = resp.into_string()?;
 
-        // Find CSRF token (64-char hex string)
-        if let Some(idx) = body.find("const CSRF=\"") {
-            let token_start = idx + "const CSRF=\"".len();
-            if token_start + 64 <= body.len() {
-                self.csrf_token = body[token_start..token_start + 64].to_string();
-            } else {
-                return Err(ClientError::Other(
-                    "CSRF token position out of bounds".into(),
-                ));
-            }
-        } else {
-            return Err(ClientError::Other(
-                "Could not find CSRF token on main page".into(),
-            ));
-        }
+        self.csrf_token = extract_csrf_token(&body)
+            .ok_or_else(|| ClientError::Other("Could not find CSRF token on main page".into()))?;
 
-        // 2. Get initial random email
-        let index_url = format!(
-            "https://www.fakemail.net/index/index?csrf_token={}",
-            self.csrf_token
-        );
-        let resp = self
-            .request("GET", &index_url)
-            .set("Referer", "https://www.fakemail.net/")
-            .set("X-Requested-With", "XMLHttpRequest")
-            .call()?;
+        let index_url = endpoint(&format!("/index/index?csrf_token={}", self.csrf_token));
+        let resp = self.ajax_request("GET", &index_url).call()?;
 
         update_cookies(&mut self.cookies, &resp);
         let body = resp.into_string()?;
-        let body_clean = body.strip_prefix("\u{feff}").unwrap_or(&body);
+        let body_clean = body.strip_prefix('\u{feff}').unwrap_or(&body);
 
         let json_data: serde_json::Value = serde_json::from_str(body_clean)?;
-        if let Some(email) = json_data
+        self.email = json_data
             .get("email")
-            .and_then(|v: &serde_json::Value| v.as_str())
-        {
-            self.email = email.to_string();
-        } else {
-            return Err(ClientError::Other(
-                "Email not found in index response".into(),
-            ));
-        }
-        if let Some(heslo) = json_data
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ClientError::Other("Email not found in index response".into()))?
+            .to_string();
+        self.password = json_data
             .get("heslo")
-            .and_then(|v: &serde_json::Value| v.as_str())
-        {
-            self.password = heslo.to_string();
-        } else {
-            self.password = String::new();
-        }
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         self.save_session()?;
         Ok(())
     }
 
     pub fn set_custom_username(&mut self, prefix: &str) -> Result<String, ClientError> {
-        let cleaned_prefix: String = prefix
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
-            .collect::<String>()
-            .to_lowercase();
-
-        if cleaned_prefix.len() < 3 || cleaned_prefix.len() > 18 {
-            return Err(ClientError::Other(
-                "Username must be between 3 and 18 characters.".into(),
-            ));
-        }
-
+        let cleaned_prefix = validate_username(prefix)?;
+        let url = endpoint("/index/new-email/");
         let resp = self
-            .request("POST", "https://www.fakemail.net/index/new-email/")
-            .set("Referer", "https://www.fakemail.net/")
-            .set("X-Requested-With", "XMLHttpRequest")
+            .ajax_request("POST", &url)
             .send_form(&[("emailInput", cleaned_prefix.as_str()), ("format", "json")])?;
 
         update_cookies(&mut self.cookies, &resp);
         let body = resp.into_string()?;
         let body_clean = body
-            .strip_prefix("\u{feff}")
+            .strip_prefix('\u{feff}')
             .unwrap_or(&body)
             .trim()
             .trim_matches('"');
@@ -280,11 +387,8 @@ impl FakeMailClient {
     }
 
     fn get_inbox_internal(&mut self) -> Result<serde_json::Value, ClientError> {
-        let resp = self
-            .request("GET", "https://www.fakemail.net/index/refresh")
-            .set("Referer", "https://www.fakemail.net/")
-            .set("X-Requested-With", "XMLHttpRequest")
-            .call()?;
+        let url = endpoint("/index/refresh");
+        let resp = self.ajax_request("GET", &url).call()?;
 
         if is_redirected_to_home(&resp) {
             return Err(ClientError::SessionExpired);
@@ -292,18 +396,17 @@ impl FakeMailClient {
 
         update_cookies(&mut self.cookies, &resp);
         let body = resp.into_string()?;
-        let body_clean = body.strip_prefix("\u{feff}").unwrap_or(&body);
+        let body_clean = body.strip_prefix('\u{feff}').unwrap_or(&body);
 
         if is_html_response(body_clean) {
             return Err(ClientError::SessionExpired);
         }
 
-        let json_val = serde_json::from_str(body_clean)?;
-        Ok(json_val)
+        Ok(serde_json::from_str(body_clean)?)
     }
 
-    fn read_email_internal(&mut self, email_id: &str) -> Result<String, ClientError> {
-        let url = format!("https://www.fakemail.net/email/id/{}", email_id);
+    fn read_email_internal(&mut self, email_id: u64) -> Result<String, ClientError> {
+        let url = endpoint(&format!("/email/id/{email_id}"));
         let resp = self.request("GET", &url).call()?;
 
         if is_redirected_to_home(&resp) {
@@ -312,7 +415,7 @@ impl FakeMailClient {
 
         update_cookies(&mut self.cookies, &resp);
         let body = resp.into_string()?;
-        let body_clean = body.strip_prefix("\u{feff}").unwrap_or(&body);
+        let body_clean = body.strip_prefix('\u{feff}').unwrap_or(&body);
 
         if body_clean.contains("const CSRF=\"") || body_clean.contains("id=\"emailAddr\"") {
             return Err(ClientError::SessionExpired);
@@ -322,13 +425,12 @@ impl FakeMailClient {
         Ok(clean_whitespace(&text))
     }
 
-    fn delete_email_internal(&mut self, email_id: &str) -> Result<(), ClientError> {
-        let url = format!("https://www.fakemail.net/delete-email/{}", email_id);
+    fn delete_email_internal(&mut self, email_id: u64) -> Result<(), ClientError> {
+        let url = endpoint(&format!("/delete-email/{email_id}"));
+        let id = email_id.to_string();
         let resp = self
-            .request("POST", &url)
-            .set("Referer", "https://www.fakemail.net/")
-            .set("X-Requested-With", "XMLHttpRequest")
-            .send_form(&[("id", email_id)])?;
+            .ajax_request("POST", &url)
+            .send_form(&[("id", id.as_str())])?;
 
         if is_redirected_to_home(&resp) {
             return Err(ClientError::SessionExpired);
@@ -336,7 +438,7 @@ impl FakeMailClient {
 
         update_cookies(&mut self.cookies, &resp);
         let body = resp.into_string()?;
-        let body_clean = body.strip_prefix("\u{feff}").unwrap_or(&body).trim();
+        let body_clean = body.strip_prefix('\u{feff}').unwrap_or(&body).trim();
 
         if is_html_response(body_clean) {
             return Err(ClientError::SessionExpired);
@@ -352,7 +454,7 @@ impl FakeMailClient {
     }
 
     fn extend_lifetime_internal(&mut self, seconds: u64) -> Result<(), ClientError> {
-        let url = format!("https://www.fakemail.net/expirace/{}", seconds);
+        let url = endpoint(&format!("/expirace/{seconds}"));
         let resp = self.request("GET", &url).call()?;
 
         if is_redirected_to_home(&resp) {
@@ -365,11 +467,8 @@ impl FakeMailClient {
     }
 
     fn get_lifetime_internal(&mut self) -> Result<(String, String), ClientError> {
-        let resp = self
-            .request("GET", "https://www.fakemail.net/index/zivot")
-            .set("Referer", "https://www.fakemail.net/")
-            .set("X-Requested-With", "XMLHttpRequest")
-            .call()?;
+        let url = endpoint("/index/zivot");
+        let resp = self.ajax_request("GET", &url).call()?;
 
         if is_redirected_to_home(&resp) {
             return Err(ClientError::SessionExpired);
@@ -377,7 +476,7 @@ impl FakeMailClient {
 
         update_cookies(&mut self.cookies, &resp);
         let body = resp.into_string()?;
-        let body_clean = body.strip_prefix("\u{feff}").unwrap_or(&body);
+        let body_clean = body.strip_prefix('\u{feff}').unwrap_or(&body);
 
         if is_html_response(body_clean) {
             return Err(ClientError::SessionExpired);
@@ -386,12 +485,12 @@ impl FakeMailClient {
         let json_data: serde_json::Value = serde_json::from_str(body_clean)?;
         let ted = json_data
             .get("ted")
-            .and_then(|v: &serde_json::Value| v.as_str())
+            .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
         let konec = json_data
             .get("konec")
-            .and_then(|v: &serde_json::Value| v.as_str())
+            .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
 
@@ -413,29 +512,21 @@ impl FakeMailClient {
     }
 
     pub fn read_email(&mut self, email_id: &str) -> Result<String, ClientError> {
+        let email_id = parse_email_id(email_id)?;
         match self.read_email_internal(email_id) {
-            Err(ClientError::SessionExpired) => {
-                self.init_new_session()?;
-                eprintln!(
-                    "\x1B[33mSession expired. Generated new mailbox: {}\x1B[0m",
-                    self.email
-                );
-                self.read_email_internal(email_id)
-            }
+            Err(ClientError::SessionExpired) => Err(ClientError::Other(
+                "Session expired; message-specific read was not retried against a new mailbox. Run list to refresh the session.".into(),
+            )),
             other => other,
         }
     }
 
     pub fn delete_email(&mut self, email_id: &str) -> Result<(), ClientError> {
+        let email_id = parse_email_id(email_id)?;
         match self.delete_email_internal(email_id) {
-            Err(ClientError::SessionExpired) => {
-                self.init_new_session()?;
-                eprintln!(
-                    "\x1B[33mSession expired. Generated new mailbox: {}\x1B[0m",
-                    self.email
-                );
-                self.delete_email_internal(email_id)
-            }
+            Err(ClientError::SessionExpired) => Err(ClientError::Other(
+                "Session expired; message-specific delete was not retried against a new mailbox. Run list to refresh the session.".into(),
+            )),
             other => other,
         }
     }
